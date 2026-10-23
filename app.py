@@ -1,5 +1,5 @@
 """
-mRNA and Protein Sequence catcher
+Sequence Fetcher
 ----------------
 Streamlit app that pulls nucleotide and protein sequences for a gene and reports
 length, GC content, protein molecular weight and pI.
@@ -254,7 +254,10 @@ def region_rows(entry: dict, seq: str) -> list:
             mask[i] = False
     mature = "".join(c for c, keep in zip(seq, mask) if keep)
     if len(mature) != len(seq):
-        rows.append(("Mature (signal peptide / propeptide removed)", f"{len(mature)} residues", mature))
+        kept = [i + 1 for i, k in enumerate(mask) if k]
+        contiguous = kept and kept[-1] - kept[0] + 1 == len(kept)
+        span = f"{kept[0]}-{kept[-1]}" if contiguous else f"{len(mature)} residues (non-contiguous)"
+        rows.append(("Mature (signal peptide / propeptide removed)", span, mature))
     for _, s, e, d in feats(entry, {"Chain"}):
         if e > len(seq):
             continue
@@ -560,6 +563,26 @@ with tab_mature:
             }
         )
     st.dataframe(pd.DataFrame(table), hide_index=True)
+
+    labels = [r[0] for r in rows]
+    pick = st.selectbox(
+        "Show sequence for",
+        labels,
+        index=1 if len(labels) > 1 else 0,
+        help="Pick the mature protein or an individual chain to copy or download its sequence.",
+    )
+    r_label, r_span, r_seq = rows[labels.index(pick)]
+    r_header = f"{iso_id} {protein_name(entry)} | {r_label} | residues {r_span} | OS={org}"
+    r_fa = fasta(r_header, r_seq)
+    r_file = re.sub(r"[^A-Za-z0-9]+", "_", r_label)[:40].strip("_")
+    st.code(r_fa, language=None)
+    dl1, dl2 = st.columns(2)
+    dl1.download_button("Download this sequence (FASTA)", r_fa, f"{gene}_{r_file}.fasta", key="dl_region")
+    all_fa = "".join(
+        fasta(f"{iso_id} {protein_name(entry)} | {lbl} | residues {sp} | OS={org}", sq) for lbl, sp, sq in rows
+    )
+    dl2.download_button("Download all regions (FASTA)", all_fa, f"{gene}_all_regions.fasta", key="dl_regions_all")
+
     if len(rows) == 1 and rec["canonical"]:
         st.caption("UniProt has no signal peptide, propeptide or chain annotation for this entry.")
     if rec["canonical"]:
