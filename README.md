@@ -1,4 +1,4 @@
-# Sequence Fetcher
+# mRNA and Protein Sequence Catcher
 
 A free web tool for retrieving gene sequences and basic properties.
 
