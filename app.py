@@ -313,50 +313,15 @@ def clean_protein(seq: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Feature map
+# mRNA map, oligo and peptide placement
 # --------------------------------------------------------------------------- #
-def feature_map(entry: dict, length: int):
-    layers = [
-        ("Signal", {"Signal"}, "#e0a030"),
-        ("Chains", {"Chain"}, "#4c78a8"),
-        ("Topology", {"Topological domain"}, "#8a8f98"),
-        ("Transmembrane", {"Transmembrane"}, "#d1495b"),
-        ("Domains", {"Domain", "Repeat"}, "#3aa17e"),
-    ]
-    layers = [(n, t, c, feats(entry, t)) for n, t, c in layers]
-    layers = [x for x in layers if x[3]]
-    if not layers:
-        return None
-    fig = go.Figure()
-    for row, (name, _, color, items) in enumerate(layers):
-        y = len(layers) - row
-        xs, hover = [], []
-        for ftype, s, e, desc in items:
-            fig.add_shape(
-                type="rect", x0=s - 1, x1=e, y0=y - 0.32, y1=y + 0.32,
-                fillcolor=color, line=dict(width=0.5, color="rgba(0,0,0,0.35)"), opacity=0.9,
-            )
-            xs.append((s - 1 + e) / 2)
-            hover.append(f"{ftype}: {desc or '-'}<br>residues {s}-{e}")
-        fig.add_trace(
-            go.Scatter(
-                x=xs, y=[y] * len(xs), mode="markers", marker=dict(opacity=0, size=14),
-                text=hover, hoverinfo="text", showlegend=False,
-            )
-        )
-    fig.update_xaxes(range=[0, length], title="Residue (canonical isoform)")
-    fig.update_yaxes(
-        tickvals=[len(layers) - i for i in range(len(layers))],
-        ticktext=[x[0] for x in layers],
-        range=[0.4, len(layers) + 0.6], showgrid=False, zeroline=False,
-    )
-    fig.update_layout(height=70 + 46 * len(layers), margin=dict(l=10, r=10, t=10, b=10))
-    return fig
+STD_AA = "ACDEFGHIKLMNPQRSTVWY"
 
 
-# --------------------------------------------------------------------------- #
-# mRNA map and oligo placement
-# --------------------------------------------------------------------------- #
+def esc_html(t: str) -> str:
+    return t.replace("<", "&lt;").replace(">", "&gt;")
+
+
 def revcomp(s: str) -> str:
     return str(Seq(s).reverse_complement())
 
@@ -380,6 +345,25 @@ def parse_oligos(text: str) -> list:
     return out
 
 
+def parse_peptides(text: str) -> list:
+    """Accepts 'name peptide' lines, bare peptides, or FASTA records (one-letter codes)."""
+    out, pending = [], None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            pending = line[1:].strip() or None
+            continue
+        tokens = [t for t in re.split(r"[\s:,;]+", line) if t]
+        pep = re.sub(f"[^{STD_AA}]", "", re.sub(r"[^A-Za-z]", "", tokens[-1]).upper())
+        name = " ".join(tokens[:-1]) or pending or f"Peptide {len(out) + 1}"
+        pending = None
+        if pep:
+            out.append((name, pep))
+    return out
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def find_oligo(mrna: str, name: str, oligo: str, max_mm: int) -> list:
     """Find an oligo on the transcript, same sense (forward) or reverse complement (reverse)."""
@@ -400,6 +384,47 @@ def find_oligo(mrna: str, name: str, oligo: str, max_mm: int) -> list:
     return hits
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def find_peptide(prot: str, name: str, pep: str, max_mm: int) -> list:
+    """Find a peptide in the protein translated from this transcript (1-based residues)."""
+    hits, n = [], len(pep)
+    for i in range(len(prot) - n + 1):
+        mm = 0
+        for x, y in zip(prot[i : i + n], pep):
+            if x != y:
+                mm += 1
+                if mm > max_mm:
+                    break
+        if mm <= max_mm:
+            hits.append({"name": name, "start": i + 1, "end": i + n, "mismatches": mm})
+    return hits
+
+
+def annotate_span(entry: dict, start: int, end: int) -> dict:
+    """What UniProt annotates under residues start-end (1-based, inclusive)."""
+
+    def over(types):
+        return [x for x in feats(entry, types) if x[1] <= end and start <= x[2]]
+
+    topo = sorted({x[3] for x in over({"Topological domain"}) if x[3]})
+    tm = over({"Transmembrane"})
+    sig = over({"Signal"})
+    doms = [x[3] or x[0] for x in over({"Domain", "Repeat"})]
+    chains_all = feats(entry, {"Chain", "Peptide"})
+    chains = [x[3] or "Chain" for x in chains_all if x[1] <= end and start <= x[2]]
+    within = (
+        ("Yes" if any(x[1] <= start and end <= x[2] for x in chains_all) else "No") if chains_all else "n/a"
+    )
+    return {
+        "Topology": "; ".join(topo) or "n/a",
+        "Transmembrane": f"Yes ({len(tm)} segment{'s' if len(tm) != 1 else ''})" if tm else "No",
+        "Signal peptide": "Overlaps" if sig else "No",
+        "Domain(s)": "; ".join(doms) or "-",
+        "Chain(s)": "; ".join(chains) or "-",
+        "Within one chain": within,
+    }
+
+
 def region_name(pos0: int, c0: int, c1: int) -> str:
     return "5' UTR" if pos0 < c0 else ("CDS" if pos0 < c1 else "3' UTR")
 
@@ -409,7 +434,8 @@ def region_span(a0: int, b0: int, c0: int, c1: int) -> str:
     return r1 if r1 == r2 else f"{r1} / {r2}"
 
 
-def map_figure(gb: dict, entry: dict, show_protein: bool, hits: list):
+def map_figure(gb: dict, entry: dict, prot: str, show_protein: bool, hits: list, pep_hits: list, on: dict):
+    """Scaled transcript diagram. `on` says which optional rows to draw."""
     n = len(gb["mrna"])
     c0, c1 = gb["cds_start"], gb["cds_end"]
     rows = []  # (label, [(x0, x1, color, hover, half_height)])
@@ -421,7 +447,7 @@ def map_figure(gb: dict, entry: dict, show_protein: bool, hits: list):
     ]
     rows.append(("Transcript", [p for p in parts if p[1] > p[0]]))
 
-    if gb.get("exons"):
+    if on.get("exons") and gb.get("exons"):
         items = []
         for k, (a, b) in enumerate(gb["exons"], start=1):
             items.append((a, b, "#4c78a8" if k % 2 else "#86a8cf", f"Exon {k}: {a + 1}-{b} ({b - a:,} nt)", 0.28))
@@ -429,39 +455,62 @@ def map_figure(gb: dict, entry: dict, show_protein: bool, hits: list):
 
     if show_protein:
         layers = [
-            ("Signal peptide", {"Signal"}, "#e0a030"),
-            ("Chains", {"Chain"}, "#7b6fb5"),
-            ("Transmembrane", {"Transmembrane"}, "#d1495b"),
-            ("Domains", {"Domain", "Repeat"}, "#3aa17e"),
+            ("signal", "Signal peptide", {"Signal"}, "#e0a030"),
+            ("chains", "Chains", {"Chain"}, "#7b6fb5"),
+            ("tm", "Transmembrane", {"Transmembrane"}, "#d1495b"),
+            ("domains", "Domains", {"Domain", "Repeat"}, "#3aa17e"),
+            ("glyc", "Glycosylation", {"Glycosylation"}, "#2b8cbe"),
+            ("mods", "Modified residues", {"Modified residue"}, "#e377c2"),
         ]
-        for label, types, color in layers:
-            items = [
-                (c0 + (s - 1) * 3, c0 + e * 3, color, f"{t}: {d or '-'}<br>aa {s}-{e}", 0.28)
-                for t, s, e, d in feats(entry, types)
-            ]
+        for key, label, types, color in layers:
+            if not on.get(key):
+                continue
+            items = []
+            for t, s, e, d in feats(entry, types):
+                head = f"{prot[s - 1]}{s}" if s == e and s <= len(prot) else f"aa {s}-{e}"
+                hover = f"{t}: {head}" + (f"<br>{esc_html(d[:140])}" if d else "")
+                items.append((c0 + (s - 1) * 3, c0 + e * 3, color, hover, 0.28))
             if items:
                 rows.append((label, items))
 
-    if gb.get("polya"):
+    if on.get("polya") and gb.get("polya"):
         rows.append(
             ("PolyA", [(a, b, "#b5651d", f"{t.replace('_', ' ')}: {a + 1}-{b}", 0.28) for t, a, b in gb["polya"]])
         )
 
-    for orient, label, color in (("forward", "Forward oligos", "#17a2b8"), ("reverse", "Reverse oligos", "#e83e8c")):
-        items = [
+    if on.get("oligos"):
+        for orient, label, color in (("forward", "Forward oligos", "#17a2b8"), ("reverse", "Reverse oligos", "#e83e8c")):
+            items = [
+                (
+                    h["start"] - 1, h["end"], color,
+                    f"{esc_html(h['name'])} ({orient})<br>{h['start']}-{h['end']}, {h['mismatches']} mismatch(es)",
+                    0.28,
+                )
+                for h in hits
+                if h["orientation"] == orient
+            ]
+            if items:
+                rows.append((label, items))
+
+    if on.get("peptides") and pep_hits:
+        rows.append(
             (
-                h["start"] - 1, h["end"], color,
-                f"{h['name']} ({orient})<br>{h['start']}-{h['end']}, {h['mismatches']} mismatch(es)", 0.28,
+                "Peptides",
+                [
+                    (
+                        c0 + (h["start"] - 1) * 3, c0 + h["end"] * 3, "#9c27b0",
+                        f"{esc_html(h['name'])}<br>aa {h['start']}-{h['end']}, nt {c0 + (h['start'] - 1) * 3 + 1}-"
+                        f"{c0 + h['end'] * 3}, {h['mismatches']} mismatch(es)",
+                        0.28,
+                    )
+                    for h in pep_hits
+                ],
             )
-            for h in hits
-            if h["orientation"] == orient
-        ]
-        if items:
-            rows.append((label, items))
+        )
 
     fig = go.Figure()
     total = len(rows)
-    wmin = n * 0.003  # keep one-nucleotide features visible
+    wmin = n * 0.003  # keep one-nucleotide and single-residue features visible
     for idx_, (label, items) in enumerate(rows):
         y = total - idx_
         xs, hov = [], []
@@ -479,12 +528,13 @@ def map_figure(gb: dict, entry: dict, show_protein: bool, hits: list):
                 text=hov, hoverinfo="text", showlegend=False,
             )
         )
-    for x, text in ((c0, "ATG"), (c1, "stop")):
-        fig.add_shape(
-            type="line", x0=x, x1=x, y0=0.45, y1=total + 0.45,
-            line=dict(width=1, color="rgba(128,128,128,0.8)", dash="dot"),
-        )
-        fig.add_annotation(x=x, y=total + 0.62, text=text, showarrow=False, font=dict(size=10))
+    if on.get("codons", True):
+        for x, text in ((c0, "ATG"), (c1, "stop")):
+            fig.add_shape(
+                type="line", x0=x, x1=x, y0=0.45, y1=total + 0.45,
+                line=dict(width=1, color="rgba(128,128,128,0.8)", dash="dot"),
+            )
+            fig.add_annotation(x=x, y=total + 0.62, text=text, showarrow=False, font=dict(size=10))
     fig.update_xaxes(range=[0, n], title="Position in transcript (nt)")
     fig.update_yaxes(
         tickvals=[total - i for i in range(total)],
@@ -492,177 +542,6 @@ def map_figure(gb: dict, entry: dict, show_protein: bool, hits: list):
         range=[0.4, total + 0.95], showgrid=False, zeroline=False,
     )
     fig.update_layout(height=100 + 46 * total, margin=dict(l=10, r=10, t=10, b=10))
-    return fig
-
-
-# --------------------------------------------------------------------------- #
-# Protein map and peptide placement
-# --------------------------------------------------------------------------- #
-# label, UniProt feature types, colour, shown by default
-PROTEIN_LAYERS = [
-    ("Signal / propeptide", {"Signal", "Propeptide"}, "#e0a030", True),
-    ("Chains", {"Chain", "Peptide"}, "#7b6fb5", True),
-    ("Topology", {"Topological domain"}, "#8a8f98", True),
-    ("Transmembrane", {"Transmembrane"}, "#d1495b", True),
-    ("Domains and repeats", {"Domain", "Repeat", "Zinc finger", "DNA binding"}, "#3aa17e", True),
-    ("Glycosylation", {"Glycosylation"}, "#2b8cbe", True),
-    ("Modified residues", {"Modified residue"}, "#e377c2", True),
-    ("Disulfide bonds", {"Disulfide bond"}, "#8c6d31", True),
-    ("Lipidation / cross-links", {"Lipidation", "Cross-link"}, "#7f7f7f", False),
-    ("Active and binding sites", {"Active site", "Binding site", "Site"}, "#17becf", False),
-    ("Motifs", {"Motif"}, "#bcbd22", False),
-    ("Regions", {"Region"}, "#9aa5b1", False),
-    ("Natural variants", {"Natural variant"}, "#ff7f0e", False),
-    ("Mutagenesis", {"Mutagenesis"}, "#b22222", False),
-]
-STD_AA = "ACDEFGHIKLMNPQRSTVWY"
-
-
-def prot_feats(e: dict, types: set, seq: str) -> list:
-    """UniProt features as (type, start, end, short label, description), 1-based inclusive."""
-    out = []
-    for f in e.get("features", []):
-        t = f.get("type")
-        if t not in types:
-            continue
-        loc = f.get("location", {})
-        s = loc.get("start", {}).get("value")
-        en = loc.get("end", {}).get("value")
-        if not (isinstance(s, int) and isinstance(en, int)) or s < 1 or en > len(seq) or en < s:
-            continue
-        alt = f.get("alternativeSequence") or {}
-        orig = alt.get("originalSequence")
-        alts = "/".join(alt.get("alternativeSequences", [])[:3])
-        if orig and alts and s == en:
-            head = f"{orig}{s}{alts}"
-        elif s == en:
-            head = f"{seq[s - 1]}{s}"
-        else:
-            head = f"{s}-{en}"
-        out.append((t, s, en, head, f.get("description", "") or ""))
-    return sorted(out, key=lambda x: (x[1], x[2]))
-
-
-def parse_peptides(text: str) -> list:
-    out, pending = [], None
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith(">"):
-            pending = line[1:].strip() or None
-            continue
-        tokens = [t for t in re.split(r"[\s:,;]+", line) if t]
-        pep = re.sub(f"[^{STD_AA}]", "", re.sub(r"[^A-Za-z]", "", tokens[-1]).upper())
-        name = " ".join(tokens[:-1]) or pending or f"Peptide {len(out) + 1}"
-        pending = None
-        if pep:
-            out.append((name, pep))
-    return out
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def find_peptide(seq: str, name: str, pep: str, max_mm: int, il_same: bool) -> list:
-    a, q = (seq.replace("I", "L"), pep.replace("I", "L")) if il_same else (seq, pep)
-    hits, n = [], len(q)
-    for i in range(len(a) - n + 1):
-        mm = 0
-        for x, y in zip(a[i : i + n], q):
-            if x != y:
-                mm += 1
-                if mm > max_mm:
-                    break
-        if mm <= max_mm:
-            hits.append({"name": name, "start": i + 1, "end": i + n, "mismatches": mm})
-    return hits
-
-
-def annotate_span(entry: dict, seq: str, start: int, end: int) -> dict:
-    """What UniProt annotates under residues start-end (1-based, inclusive)."""
-
-    def over(types):
-        return [x for x in prot_feats(entry, types, seq) if x[1] <= end and start <= x[2]]
-
-    topo = sorted({x[4] for x in over({"Topological domain"}) if x[4]})
-    tm = over({"Transmembrane"})
-    sig = over({"Signal"})
-    doms = [x[4] or x[0] for x in over({"Domain", "Repeat", "Zinc finger", "DNA binding"})]
-    chains_all = prot_feats(entry, {"Chain", "Peptide"}, seq)
-    chains = [x[4] or "Chain" for x in chains_all if x[1] <= end and start <= x[2]]
-    within = (
-        ("Yes" if any(x[1] <= start and end <= x[2] for x in chains_all) else "No") if chains_all else "n/a"
-    )
-    glyc = [x[3] for x in over({"Glycosylation"}) if start <= x[1] and x[2] <= end]
-    return {
-        "Topology": "; ".join(topo) or "n/a",
-        "Transmembrane": f"Yes ({len(tm)} segment{'s' if len(tm) != 1 else ''})" if tm else "No",
-        "Signal peptide": "Overlaps" if sig else "No",
-        "Domain(s)": "; ".join(doms) or "-",
-        "Chain(s)": "; ".join(chains) or "-",
-        "Within one chain": within,
-        "Glycosylation sites": ", ".join(glyc) or "-",
-    }
-
-
-def protein_map_figure(entry: dict, seq: str, chosen: list, hits: list):
-    L = len(seq)
-    rows = []  # (label, [(x0, x1, colour, hover, half_height)])
-    for label, types, color, _ in PROTEIN_LAYERS:
-        if label not in chosen:
-            continue
-        items = []
-        for t, s, e, head, desc in prot_feats(entry, types, seq):
-            hover = f"{t}: {head}"
-            if desc:
-                hover += "<br>" + desc[:140].replace("<", "&lt;").replace(">", "&gt;")
-            if t == "Disulfide bond" and e > s:
-                items.append((s - 1, e, color, hover, 0.07))
-                items.append((s - 1, s, color, hover, 0.28))
-                items.append((e - 1, e, color, hover, 0.28))
-            else:
-                items.append((s - 1, e, color, hover, 0.28))
-        if items:
-            rows.append((label, items))
-    if hits:
-        rows.append(
-            (
-                "Peptides",
-                [
-                    (h["start"] - 1, h["end"], "#17a2b8",
-                     f"{h['name']}<br>{h['start']}-{h['end']}, {h['mismatches']} mismatch(es)", 0.28)
-                    for h in hits
-                ],
-            )
-        )
-    if not rows:
-        return None
-    fig = go.Figure()
-    total = len(rows)
-    wmin = L * 0.003  # keep single residues visible
-    for idx_, (label, items) in enumerate(rows):
-        y = total - idx_
-        xs, hov = [], []
-        for x0, x1, color, hover, half in items:
-            x1 = max(x1, x0 + wmin)
-            fig.add_shape(
-                type="rect", x0=x0, x1=x1, y0=y - half, y1=y + half,
-                fillcolor=color, line=dict(width=0.5, color="rgba(0,0,0,0.35)"),
-            )
-            xs.append((x0 + x1) / 2)
-            hov.append(hover)
-        fig.add_trace(
-            go.Scatter(
-                x=xs, y=[y] * len(xs), mode="markers", marker=dict(opacity=0, size=12),
-                text=hov, hoverinfo="text", showlegend=False,
-            )
-        )
-    fig.update_xaxes(range=[0, L], title="Residue (canonical isoform)")
-    fig.update_yaxes(
-        tickvals=[total - i for i in range(total)],
-        ticktext=[r[0] for r in rows],
-        range=[0.4, total + 0.6], showgrid=False, zeroline=False,
-    )
-    fig.update_layout(height=80 + 44 * total, margin=dict(l=10, r=10, t=10, b=10))
     return fig
 
 
@@ -790,8 +669,8 @@ m[3].metric("Protein length", f"{len(rec['seq']):,} aa")
 m[4].metric("Protein MW", f"{pst['mw']:.2f} kDa")
 m[5].metric("Protein pI", f"{pst['pi']:.2f}")
 
-tab_nt, tab_map, tab_prot, tab_pmap, tab_mature, tab_cmp, tab_links = st.tabs(
-    ["Nucleotide", "mRNA map", "Protein", "Protein map", "Mature vs full-length", "Species comparison", "Links"]
+tab_nt, tab_map, tab_prot, tab_mature, tab_cmp, tab_links = st.tabs(
+    ["Nucleotide", "mRNA map", "Protein", "Mature vs full-length", "Species comparison", "Links"]
 )
 
 # ---- Nucleotide ----------------------------------------------------------- #
@@ -842,18 +721,44 @@ with tab_map:
         c0, c1 = gb["cds_start"], gb["cds_end"]
         exon_list = gb.get("exons", [])
         junctions = [end for _, end in exon_list[:-1]]
-        translation_ok = str(Seq(cds).translate(to_stop=True)) == rec["seq"]
+        cds_protein = str(Seq(cds).translate(to_stop=True))
+        translation_ok = cds_protein == rec["seq"]
         show_protein = rec["canonical"] and translation_ok
 
-        with st.expander("Mark primer or siRNA sites (optional)"):
+        with st.expander("Choose what appears on the map and in the PNG"):
+            st.caption("Untick a row to remove it from the figure. The camera icon saves exactly what is shown.")
+            on = {
+                "exons": st.checkbox("Exons", value=True, key="map_exons"),
+                "signal": st.checkbox("Signal peptide", value=True, key="map_signal"),
+                "chains": st.checkbox("Chains", value=True, key="map_chains"),
+                "tm": st.checkbox("Transmembrane segments", value=True, key="map_tm"),
+                "domains": st.checkbox("Domains", value=True, key="map_domains"),
+                "glyc": st.checkbox("Glycosylation sites", value=False, key="map_glyc"),
+                "mods": st.checkbox("Modified residues (for example phosphorylation)", value=False, key="map_mods"),
+                "polya": st.checkbox("PolyA signal and site", value=True, key="map_polya"),
+                "oligos": st.checkbox("Primer and siRNA matches", value=True, key="map_oligos"),
+                "peptides": st.checkbox("Peptide matches", value=True, key="map_peptides"),
+                "codons": st.checkbox("Start and stop codon lines", value=True, key="map_codons"),
+            }
+
+        with st.expander("Mark primers, siRNAs or peptides (optional)"):
             oligo_text = st.text_area(
-                "Oligo sequences",
-                height=110,
+                "Oligo sequences (DNA or RNA, 5' to 3')",
+                height=100,
                 key="oligo_text",
                 placeholder="One per line, for example:\nTSHR-F  ACGTACGTACGTACGTACGT\nTSHR-R  TGCATGCATGCATGCATGCA",
-                help="Name and sequence on each line, a bare sequence, or FASTA. 5'->3'. U is treated as T.",
+                help="Name and sequence on each line, a bare sequence, or FASTA. U is treated as T.",
             )
-            max_mm = st.slider("Allowed mismatches", 0, 3, 0, key="oligo_mm")
+            max_mm = st.slider("Allowed mismatches (oligos)", 0, 3, 0, key="oligo_mm")
+            pep_text = st.text_area(
+                "Peptide sequences (protein, one-letter codes)",
+                height=100,
+                key="pep_text",
+                placeholder="One per line, for example:\nImmunogen  ACDEFGHIKLMNPQ\nTryptic-peptide  LVNEVTEFAK",
+                help="Antibody immunogens, epitopes or mass-spec peptides. They are located on the protein "
+                "translated from this transcript, then drawn on the CDS.",
+            )
+            pep_mm = st.slider("Allowed mismatches (peptides)", 0, 2, 0, key="pep_mm")
 
         hits, notes = [], []
         for oname, oseq in parse_oligos(oligo_text):
@@ -868,16 +773,29 @@ with tab_map:
                 )
             hits += found
 
+        pep_hits = []
+        for pname, pep in parse_peptides(pep_text):
+            if len(pep) < 5:
+                notes.append(f"{pname}: shorter than 5 residues, so it was skipped.")
+                continue
+            found = find_peptide(cds_protein, pname, pep, pep_mm)
+            if not found:
+                notes.append(
+                    f"{pname}: no match in the protein encoded by this transcript. It may belong to another "
+                    "isoform or species, or you can allow a mismatch."
+                )
+            pep_hits += found
+
         st.plotly_chart(
-            map_figure(gb, entry, show_protein, hits),
+            map_figure(gb, entry, cds_protein, show_protein, hits, pep_hits, on),
             config={"toImageButtonOptions": {"format": "png", "filename": f"{gene}_mRNA_map", "scale": 3}},
         )
         st.caption(
             f"{gb['acc']} · {mlen:,} nt. Drawn to scale. Hover over a feature for its coordinates. "
-            "The camera icon at the top right of the figure saves a high-resolution PNG."
+            "The camera icon at the top right of the figure saves a high-resolution PNG of what is shown."
         )
         if not rec["canonical"]:
-            st.caption("Protein features (signal peptide, chains, domains) are shown only for the canonical isoform.")
+            st.caption("Protein features (signal peptide, chains, domains, sites) are shown only for the canonical isoform.")
         elif not translation_ok:
             st.caption("Protein features are hidden because the RefSeq CDS does not translate to the UniProt sequence.")
         if not exon_list:
@@ -961,6 +879,29 @@ with tab_map:
                 "(for example with Primer-BLAST, linked in the Links tab) before ordering oligos."
             )
 
+        if pep_hits:
+            st.markdown("**Peptide matches**")
+            pep_rows = []
+            for h in pep_hits:
+                a0, b0 = c0 + (h["start"] - 1) * 3, c0 + h["end"] * 3
+                row = {
+                    "Peptide": h["name"],
+                    "Residues": f"{h['start']}-{h['end']}",
+                    "Transcript position (nt)": f"{a0 + 1}-{b0}",
+                    "Mismatches": h["mismatches"],
+                    "Spans exon junction": ("Yes" if any(a0 < j < b0 for j in junctions) else "No")
+                    if exon_list
+                    else "n/a",
+                }
+                if show_protein:
+                    row.update(annotate_span(entry, h["start"], h["end"]))
+                pep_rows.append(row)
+            st.dataframe(pd.DataFrame(pep_rows), hide_index=True)
+            st.caption(
+                "Annotation columns come from UniProt for the canonical isoform. 'Within one chain: No' means the "
+                "peptide crosses a cleavage site or the signal peptide boundary."
+            )
+
 # ---- Protein -------------------------------------------------------------- #
 with tab_prot:
     st.dataframe(
@@ -1033,7 +974,7 @@ with tab_mature:
     if len(rows) == 1 and rec["canonical"]:
         st.caption("UniProt has no signal peptide, propeptide or chain annotation for this entry.")
     if rec["canonical"]:
-        st.caption("The feature diagram is on the Protein map tab.")
+        st.caption("Signal peptide, chains, transmembrane segments and domains are drawn to scale on the mRNA map tab.")
     st.caption(
         "Calculated values assume no modifications. Glycosylation, phosphorylation and cleavage steps "
         "make bands on a Western blot run larger than the calculated MW."
