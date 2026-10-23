@@ -1,5 +1,5 @@
 """
-Sequence Fetcher
+mRNA and Protein Sequence catcher
 ----------------
 Streamlit app that pulls nucleotide and protein sequences for a gene and reports
 length, GC content, protein molecular weight and pI.
