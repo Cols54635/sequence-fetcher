@@ -46,6 +46,10 @@ SPECIES = {
 }
 HUMAN, MOUSE = "Human (Homo sapiens)", "Mouse (Mus musculus)"
 
+# Shown in the About box. Put an address between the quotes to display a contact line.
+CONTACT_EMAIL = ""
+LAB = "Woeller Lab, Flaum Eye Institute, University of Rochester Medical Center"
+
 ACC_RE = re.compile(
     r"^([OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2})$"
 )
@@ -346,6 +350,33 @@ def feature_map(entry: dict, length: int):
 # --------------------------------------------------------------------------- #
 st.title("🧬 Sequence Fetcher")
 st.caption("Nucleotide and protein sequences from UniProt and NCBI RefSeq, with length, GC content, MW and pI.")
+
+with st.expander("About this tool"):
+    st.markdown(
+        f"""
+Built by the **{LAB}** as a research convenience.
+It is not an official product of the University of Rochester.
+
+**What it does.** Looks up a gene, shows its RefSeq mRNA (5' UTR, coding sequence, 3' UTR) and UniProt protein,
+and calculates length, GC content, molecular weight and pI. It also compares mature and full-length forms,
+lists isoforms, and compares orthologs between species.
+
+**Where the data comes from.** Protein records, isoforms and annotations come from
+[UniProt](https://www.uniprot.org); transcripts come from [NCBI RefSeq](https://www.ncbi.nlm.nih.gov/refseq/).
+Please cite the source databases when you use their data:
+- The UniProt Consortium. *UniProt: the Universal Protein Knowledgebase.* Nucleic Acids Research.
+- O'Leary NA, et al. *Reference sequence (RefSeq) database at NCBI.* Nucleic Acids Research.
+
+**Calculations.** MW and pI are computed with Biopython's ProtParam and can differ slightly from other tools.
+Calculated MW does not account for glycosylation or other modifications, so bands on a Western blot may run larger.
+Please verify important sequences against the source record before ordering primers or constructs.
+
+**Privacy.** Only public database lookups are made, and nothing you type is stored by this app.
+Avoid entering unpublished or confidential sequences.
+"""
+    )
+    if CONTACT_EMAIL:
+        st.markdown(f"**Questions or corrections:** {CONTACT_EMAIL}")
 
 if "q" not in st.session_state:
     st.session_state.q = ("TSHR", HUMAN, 9606)
@@ -648,4 +679,4 @@ with tab_links:
     else:
         st.caption("No experimental structures are listed for this entry. The AlphaFold model may still be available.")
 
-st.caption("Data from UniProt and NCBI. Public data only; nothing you type is stored.")
+st.caption("Data from UniProt and NCBI RefSeq. Public data only; nothing you type is stored. See 'About this tool' at the top.")
